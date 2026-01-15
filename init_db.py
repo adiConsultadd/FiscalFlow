@@ -1,6 +1,7 @@
 import asyncio
 from database import engine, Base
 from sqlalchemy import text
+import models
 
 async def init_models():
     async with engine.begin() as conn:

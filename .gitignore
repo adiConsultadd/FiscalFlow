@@ -1,2 +1,13 @@
-venv
+# Python cache files (The junk you see)
+__pycache__/
+*.pyc
+
+# Environment Variables (SECURITY RISK - Do not push!)
 .env
+
+# Virtual Environment
+venv/
+.venv/
+
+# Mac system files
+.DS_Store

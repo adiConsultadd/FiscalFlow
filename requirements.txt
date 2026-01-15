@@ -5,3 +5,4 @@ asyncpg
 pgvector
 python-dotenv
 openai
+greenlet
