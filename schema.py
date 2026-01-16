@@ -1,4 +1,5 @@
 from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 
 class QueryRequest(BaseModel):
     """Request model for the query endpoint."""
