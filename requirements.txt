@@ -6,3 +6,8 @@ pgvector
 python-dotenv
 openai
 greenlet
+marker-pdf
+scikit-learn
+numpy
+pydantic
+pdfplumber

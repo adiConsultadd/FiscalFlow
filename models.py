@@ -21,6 +21,9 @@ class Node(Base):
     company_ticker = Column(String(10), nullable=False) 
     fiscal_year = Column(String(10), nullable=False)   
     fiscal_quarter = Column(String(10), nullable=True)  
+    
+    # Topic Name (Level 1)
+    topic = Column(String, nullable=True)
 
     node_metadata = Column(JSONB, default={}, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
