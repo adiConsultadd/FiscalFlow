@@ -173,28 +173,121 @@ def cluster_chunks_semantically(nodes: List[Dict[str, Any]], num_clusters: Optio
         return {0: nodes} # Fallback
 
 # -------------------------------------------------------------------------
-# 5. DB SAVING
+# 5. SUMMARIZATION ENGINE
 # -------------------------------------------------------------------------
-async def save_to_db(nodes_data: List[Dict[str, Any]], session: AsyncSession):
+async def summarize_cluster(cluster_nodes: List[Dict[str, Any]], fiscal_meta: str = "Fiscal Data") -> tuple[str, str]:
     """
-    Saves Node objects to the database.
+    Summarizes a list of nodes into a single 'Topic Node'.
     """
-    db_nodes = []
-    for data in nodes_data:
-        node = Node(
-            text_content=data["text_content"],
-            embedding=data["embedding"],
-            company_ticker=data.get("company_ticker", "UNKNOWN"),
-            fiscal_year=data.get("fiscal_year", "UNKNOWN"),
-            fiscal_quarter=data.get("fiscal_quarter"),
-            level_depth=1, # E.g., raw chunk
-            node_metadata={"provenance": data["provenance"]}
-        )
-        db_nodes.append(node)
+    # Combine text from all chunks in this cluster
+    context_text = "\n\n".join([n["text_content"] for n in cluster_nodes])
     
-    session.add_all(db_nodes)
+    # PROMPT: The 'Secret Sauce' for specific summaries
+    prompt = f"""
+    You are analyzing specific segments of a company's financial transcript for {fiscal_meta}.
+    Below are several raw text chunks that the system has identified as semantically similar.
+    
+    RAW DATA:
+    {context_text}
+    
+    TASK:
+    1. Identify the single specific topic binding these chunks (e.g., "Cloud Revenue", "Employee Attrition", "Supply Chain Issues").
+    2. Write a detailed summary (3-5 sentences) capturing the specific numbers, facts, and sentiment found in these chunks.
+    3. Do not be vague. Use actual figures if present.
+    
+    OUTPUT FORMAT:
+    Topic: [Topic Name]
+    Summary: [Detailed Summary]
+    """
+    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", # Or slightly larger if needed, but mini is good for this
+            messages=[
+                {"role": "system", "content": "You are a helpful financial analyst assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        response_text = response.choices[0].message.content
+        
+        # Simple parsing
+        topic_title = "General Topic"
+        summary_body = response_text
+        
+        lines = response_text.split('\n')
+        topic_line = next((line for line in lines if "Topic:" in line), None)
+        summary_start = next((i for i, line in enumerate(lines) if "Summary:" in line), None)
+        
+        if topic_line:
+            topic_title = topic_line.replace("Topic:", "").strip()
+            
+        if summary_start is not None:
+            summary_body = "\n".join(lines[summary_start:]).replace("Summary:", "").strip()
+            
+        return topic_title, summary_body
+    except Exception as e:
+        print(f"Summarization error: {e}")
+        return "Error Topic", "Error creating summary."
+
+
+# -------------------------------------------------------------------------
+# 6. DB SAVING
+# -------------------------------------------------------------------------
+async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], session: AsyncSession):
+    """
+    Saves hierarchical Node objects (Level 1 Topics -> Level 0 Chunks) to the database.
+    """
+    
+    for cluster_id, nodes_data in clusters.items():
+        # 1. Summarize Cluster to get Topic Node info
+        # Check metadata from first node for fiscal context logic if strictly needed, 
+        # or pass it in. For now, generic.
+        fiscal_meta = f"{nodes_data[0].get('company_ticker', '')} {nodes_data[0].get('fiscal_year', '')}"
+        topic, summary = await summarize_cluster(nodes_data, fiscal_meta=fiscal_meta)
+        
+        # 2. Create Topic Node (Level 1)
+        topic_node = Node(
+            node_id=uuid.uuid4(), # Explicitly generate to link children
+            text_content=f"{topic}\n\n{summary}", # Or just summary? User said topic node.
+            # We should probably embed the summary too for searchability of topics!
+            embedding=None, # To be generated if desired, or skip for now
+            company_ticker=nodes_data[0].get("company_ticker", "UNKNOWN"),
+            fiscal_year=nodes_data[0].get("fiscal_year", "UNKNOWN"),
+            fiscal_quarter=nodes_data[0].get("fiscal_quarter"),
+            level_depth=1, # TOPIC LEVEL
+            node_metadata={
+                "cluster_id": int(cluster_id),
+                "topic_title": topic,
+                "summary": summary,
+                "child_count": len(nodes_data)
+            }
+        )
+        
+        # OPTIONAL: Generate embedding for the topic node itself so we can search topics
+        # await generate_embeddings([{"text_content": topic_node.text_content}]) 
+        # But our function expects dicts. Let's do it manually if needed or skip.
+        # For graph traversal, we might not need vector search on topics immediately.
+        
+        session.add(topic_node)
+        await session.flush() # Ensure topic_node is tracked but not committed yet if we want transactional integrity
+        
+        # 3. Create Chunk Nodes (Level 0) linked to Topic
+        for data in nodes_data:
+            chunk_node = Node(
+                parent_node_id=topic_node.node_id,
+                text_content=data["text_content"],
+                embedding=data["embedding"],
+                company_ticker=data.get("company_ticker", "UNKNOWN"),
+                fiscal_year=data.get("fiscal_year", "UNKNOWN"),
+                fiscal_quarter=data.get("fiscal_quarter"),
+                level_depth=0, # CHUNK LEVEL (User correction: Level 1 -> Level 0)
+                node_metadata={"provenance": data["provenance"]}
+            )
+            session.add(chunk_node)
+            
     await session.commit()
-    print(f"Saved {len(db_nodes)} nodes to database.")
+    print("Saved hierarchy to database.")
 
 # -------------------------------------------------------------------------
 # ORCHESTRATOR
@@ -214,15 +307,13 @@ async def process_document(file_path: str):
     chunks_with_embeddings = await generate_embeddings(chunks)
     print("Generated embeddings.")
     
-    # 4. Cluster (Optional step - usually we cluster for higher level summarization)
-    # The prompt asks to cluster them. We can use the cluster ID to potentially create parent nodes 
-    # or just tag them. For now, let's just run it to show we can.
+    # 4. Cluster
     clusters = cluster_chunks_semantically(chunks_with_embeddings)
     print(f"Formed {len(clusters)} clusters.")
     
-    # 5. Save
+    # 5. Summarize & Save Hierarchy
     async with AsyncSessionLocal() as session:
-        await save_to_db(chunks_with_embeddings, session)
+        await save_hierarchy_to_db(clusters, session)
 
 if __name__ == "__main__":
     # Test run

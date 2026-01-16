@@ -18,6 +18,25 @@ async def main():
     
     try:
         await process_document("documents/one97/concalls/PAYTM_04112025215154_Reg30_Earnings_Release_FY26_Q2_OCL_sd.pdf")
+        
+        # Verify Hierarchy
+        async with engine.connect() as conn:
+            # Check levels
+            result = await conn.execute(sqlalchemy.text("SELECT level_depth, count(*) FROM nodes GROUP BY level_depth ORDER BY level_depth"))
+            print("\nNode Counts by Level:")
+            for row in result:
+                print(f"Level {row[0]}: {row[1]}")
+                
+            # Check linking
+            result = await conn.execute(sqlalchemy.text("SELECT count(*) FROM nodes WHERE parent_node_id IS NOT NULL"))
+            print(f"Nodes with parents: {result.scalar()}")
+            
+            # Show a sample topic
+            result = await conn.execute(sqlalchemy.text("SELECT text_content FROM nodes WHERE level_depth = 1 LIMIT 1"))
+            row = result.fetchone()
+            if row:
+                print(f"\nSample Topic Node Content:\n{row[0]}")
+
     except Exception as e:
         print(f"Processing failed: {e}")
 
