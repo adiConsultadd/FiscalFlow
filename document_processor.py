@@ -5,6 +5,7 @@ import numpy as np
 import pdfplumber
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, and_
 from openai import AsyncOpenAI
 from sklearn.cluster import KMeans
 from dotenv import load_dotenv
@@ -218,6 +219,203 @@ async def summarize_cluster(cluster_nodes: List[Dict[str, Any]], fiscal_meta: st
         print(f"Summarization error: {e}")
         return "Error Topic", "Error creating summary."
 
+# -------------------------------------------------------------------------
+# 5.1 GENERIC SUMMARIZER FOR HIGHER LEVELS
+# -------------------------------------------------------------------------
+async def summarize_text_list(texts: List[str], context: str) -> str:
+    """
+    Summarizes a list of text content into a cohesive narrative.
+    """
+    if not texts:
+        return "No content available."
+        
+    combined_text = "\n\n---\n\n".join(texts)
+    
+    prompt = f"""
+    You are a financial analyst. Synthesize the following texts into a cohesive summary for: {context}.
+    
+    INPUT TEXTS:
+    {combined_text[:20000]} # Truncate if too long, though higher levels usually fit
+    
+    TASK:
+    Write a comprehensive narrative summary (1-2 paragraphs). Focus on key financial trends, strategic updates, and risks.
+    """
+    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful financial analyst assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Level summarization error: {e}")
+        return "Error generating summary."
+
+# -------------------------------------------------------------------------
+# 5.2 HIERARCHY BUILDER (L2, L3, L4)
+# -------------------------------------------------------------------------
+async def build_hierarchy_layers(company: str, year: str, quarter: Optional[str], session: AsyncSession):
+    """
+    Builds Level 2 (Quarter), Level 3 (Year), and Level 4 (Root) nodes.
+    """
+    print(f"Building hierarchy for {company} {year} {quarter if quarter else ''}...")
+
+    # --- LEVEL 2: QUARTER NODE ---
+    if quarter:
+        # 1. Fetch L1 (Topic) Nodes
+        stmt = select(Node).where(
+            Node.company_ticker == company,
+            Node.fiscal_year == year,
+            Node.fiscal_quarter == quarter,
+            Node.level_depth == 1
+        )
+        result = await session.execute(stmt)
+        l1_nodes = result.scalars().all()
+        
+        if l1_nodes:
+            # 2. Summarize
+            l1_texts = [f"Topic: {n.topic}\n{n.text_content}" for n in l1_nodes]
+            q_summary = await summarize_text_list(l1_texts, f"{company} {year} {quarter}")
+            
+            # 3. Create or Update L2 Node
+            # Check if exists
+            stmt_check = select(Node).where(
+                Node.company_ticker == company,
+                Node.fiscal_year == year,
+                Node.fiscal_quarter == quarter,
+                Node.level_depth == 2
+            )
+            result = await session.execute(stmt_check)
+            l2_node = result.scalar_one_or_none()
+            
+            if not l2_node:
+                l2_node = Node(
+                    node_id=uuid.uuid4(),
+                    text_content=q_summary,
+                    topic=f"Overview {year} {quarter}",
+                    company_ticker=company,
+                    fiscal_year=year,
+                    fiscal_quarter=quarter,
+                    level_depth=2,
+                    node_metadata={"child_count": len(l1_nodes)}
+                )
+                session.add(l2_node)
+            else:
+                l2_node.text_content = q_summary
+                l2_node.node_metadata["child_count"] = len(l1_nodes)
+                session.add(l2_node)
+            
+            await session.flush()
+            
+            # 4. Link L1s to L2
+            for n in l1_nodes:
+                n.parent_node_id = l2_node.node_id
+                session.add(n)
+            
+            print(f"Updated L2 Node for {quarter}")
+
+    # --- LEVEL 3: YEAR NODE ---
+    # 1. Fetch L2 (Quarter) Nodes
+    stmt = select(Node).where(
+        Node.company_ticker == company,
+        Node.fiscal_year == year,
+        Node.level_depth == 2
+    )
+    result = await session.execute(stmt)
+    l2_nodes = result.scalars().all()
+    
+    if l2_nodes:
+        # 2. Summarize
+        l2_texts = [f"Quarter: {n.fiscal_quarter}\n{n.text_content}" for n in l2_nodes]
+        y_summary = await summarize_text_list(l2_texts, f"{company} {year}")
+        
+        # 3. Create or Update L3 Node
+        stmt_check = select(Node).where(
+            Node.company_ticker == company,
+            Node.fiscal_year == year,
+            Node.level_depth == 3
+        )
+        result = await session.execute(stmt_check)
+        l3_node = result.scalar_one_or_none()
+        
+        if not l3_node:
+            l3_node = Node(
+                node_id=uuid.uuid4(),
+                text_content=y_summary,
+                topic=f"Yearly Narrative {year}",
+                company_ticker=company,
+                fiscal_year=year,
+                fiscal_quarter=None,
+                level_depth=3,
+                node_metadata={"child_count": len(l2_nodes)}
+            )
+            session.add(l3_node)
+        else:
+            l3_node.text_content = y_summary
+            l3_node.node_metadata["child_count"] = len(l2_nodes)
+            session.add(l3_node)
+            
+        await session.flush()
+        
+        # 4. Link L2s to L3
+        for n in l2_nodes:
+            n.parent_node_id = l3_node.node_id
+            session.add(n)
+            
+        print(f"Updated L3 Node for {year}")
+
+    # --- LEVEL 4: ROOT NODE ---
+    # 1. Fetch L3 (Year) Nodes
+    stmt = select(Node).where(
+        Node.company_ticker == company,
+        Node.level_depth == 3
+    )
+    result = await session.execute(stmt)
+    l3_nodes = result.scalars().all()
+    
+    if l3_nodes:
+        # 2. Summarize
+        l3_texts = [f"Year: {n.fiscal_year}\n{n.text_content}" for n in l3_nodes]
+        root_summary = await summarize_text_list(l3_texts, f"{company} Narrative Arc")
+        
+        # 3. Create or Update L4 Node
+        stmt_check = select(Node).where(
+            Node.company_ticker == company,
+            Node.level_depth == 4
+        )
+        result = await session.execute(stmt_check)
+        l4_node = result.scalar_one_or_none()
+        
+        if not l4_node:
+            l4_node = Node(
+                node_id=uuid.uuid4(),
+                text_content=root_summary,
+                topic=f"{company} Narrative Arc",
+                company_ticker=company,
+                fiscal_year="ALL",
+                fiscal_quarter=None,
+                level_depth=4,
+                node_metadata={"child_count": len(l3_nodes)}
+            )
+            session.add(l4_node)
+        else:
+            l4_node.text_content = root_summary
+            l4_node.node_metadata["child_count"] = len(l3_nodes)
+            session.add(l4_node)
+            
+        await session.flush()
+        
+        # 4. Link L3s to L4
+        for n in l3_nodes:
+            n.parent_node_id = l4_node.node_id
+            session.add(n)
+            
+        print(f"Updated L4 Root Node for {company}")
+
 
 # -------------------------------------------------------------------------
 # 6. DB SAVING
@@ -306,9 +504,14 @@ async def process_document(file_path: str,
     clusters = cluster_chunks_semantically(chunks_with_embeddings)
     print(f"Formed {len(clusters)} clusters.")
     
-    # 5. Summarize & Save Hierarchy
+    # 5. Summarize & Save Hierarchy (L0 & L1)
     async with AsyncSessionLocal() as session:
         await save_hierarchy_to_db(clusters, session)
+        
+        # 6. Build Higher Layers (L2, L3, L4)
+        await build_hierarchy_layers(company_ticker, fiscal_year, fiscal_quarter, session)
+        await session.commit() # Commit all hierarchy changes
+
 
 if __name__ == "__main__":
     import sys
