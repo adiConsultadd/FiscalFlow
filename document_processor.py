@@ -3,6 +3,9 @@ import asyncio
 import uuid
 import numpy as np
 import pdfplumber
+from marker.converters.pdf import PdfConverter
+from marker.models import create_model_dict
+from marker.output import text_from_rendered
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, and_
@@ -19,8 +22,103 @@ load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # -------------------------------------------------------------------------
-# 1. PARSER FUNCTION (Support PDF)
+# 1. PARSER FUNCTION (OCR with Marker)
 # -------------------------------------------------------------------------
+def parse_pdf_with_marker(file_path: str) -> List[Dict[str, Any]]:
+    """
+    Parses a PDF using Marker (OCR) and extracts text blocks with BBox metadata.
+    """
+    print(f"Parsing {file_path} with Marker (OCR)...")
+    extracted_data = []
+    file_name = os.path.basename(file_path)
+
+    try:
+        # Initialize marker
+        converter = PdfConverter(
+            artifact_dict=create_model_dict(),
+        )
+        rendered = converter(file_path)
+        
+        # Traverse the Rendered object
+        # Structure: Rendered -> children (Pages) -> children (Blocks/Lines)
+        
+        if hasattr(rendered, 'children'):
+            for i, page in enumerate(rendered.children):
+                page_width = 0
+                page_height = 0
+                
+                # Try to find page dimensions if available
+                if hasattr(page, 'polygon'):
+                     # Polygon is usually [x, y, x, y...]. BBox is cleaner if present.
+                     pass
+                
+                # Check blocks
+                if hasattr(page, 'children'):
+                    for block in page.children:
+                        # Extract text
+                        # block might be a TextBlock, Image, etc.
+                        # We use simple string representation or check content
+                        # Marker blocks usually have a 'html' or 'text' property or __str__
+                        
+                        # Fallback for text extraction from block
+                        text = ""
+                        if hasattr(block, 'html'):
+                            text = block.html
+                        elif hasattr(block, 'lines'):
+                             # Some versions use lines
+                             text = "\n".join([l.html for l in block.lines])
+                        else:
+                             # Convert to string and strip tags if needed, or simplistic approach
+                             # Let's trust marker's block to string
+                             text = str(block)
+
+                        # BBox
+                        bbox = [0, 0, 0, 0] # Default
+                        if hasattr(block, 'bbox'):
+                            bbox = block.bbox
+                        elif hasattr(block, 'polygon'):
+                            # Approximate bbox from polygon
+                            xs = [p[0] for p in block.polygon]
+                            ys = [p[1] for p in block.polygon]
+                            if xs and ys:
+                                bbox = [min(xs), min(ys), max(xs), max(ys)]
+                        
+                        if text.strip():
+                            extracted_data.append({
+                                "page_index": i,
+                                "page_label": str(i+1),
+                                "file_name": file_name,
+                                "text": text, # This might be markdown/html
+                                "width": page_width, # Marker might not expose this easily per page object
+                                "height": page_height,
+                                "bbox": bbox,
+                                "is_markdown": True
+                            })
+                            
+        # Fallback if traversal failed or returned nothing
+        if not extracted_data:
+             print("Marker traversal yielded no blocks, using full text fallback.")
+             full_text, _, _ = text_from_rendered(rendered)
+             extracted_data.append({
+                 "page_index": 0,
+                 "page_label": "1-N",
+                 "file_name": file_name,
+                 "text": full_text,
+                 "width": 0,
+                 "height": 0,
+                 "bbox": [0,0,0,0],
+                 "is_markdown": True
+             })
+
+    except Exception as e:
+        print(f"Error parsing PDF with Marker {file_path}: {e}")
+        # Fallback to PDFPlumber? 
+        print("Falling back to PDFPlumber...")
+        return parse_pdf(file_path)
+    
+    return extracted_data
+
+# Keep original as fallback
 def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
     """
     Parses a PDF file and extracts text with metadata (page number, bbox, etc.)
@@ -43,7 +141,8 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
                     "text": text,
                     "words": words, 
                     "width": page.width,
-                    "height": page.height
+                    "height": page.height,
+                    "bbox": [0, 0, page.width, page.height] # Page level
                 })
     except Exception as e:
         print(f"Error parsing PDF {file_path}: {e}")
@@ -82,7 +181,7 @@ def semantic_chunking(parsed_data: List[Dict[str, Any]],
                 "page_index": page_index,
                 "page_label": page_label,
                 "file_name": file_name,
-                "bbox": [0, 0, float(page_data["width"]), float(page_data["height"])], 
+                "bbox": page_data.get("bbox", [0, 0, 0, 0]), 
                 "char_start": i,
                 "char_end": end
             }
@@ -486,8 +585,9 @@ async def process_document(file_path: str,
     print(f"Processing {file_path} for {company_ticker} {fiscal_year} {fiscal_quarter}...")
     
     # 1. Parse
-    parsed_data = parse_pdf(file_path)
-    print(f"Parsed {len(parsed_data)} pages.")
+    # parsed_data = parse_pdf(file_path) # Old parser
+    parsed_data = parse_pdf_with_marker(file_path) # New Marker parser
+    print(f"Parsed {len(parsed_data)} blocks/pages.")
     
     # 2. Chunk
     chunks = semantic_chunking(parsed_data, 
