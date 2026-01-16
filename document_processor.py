@@ -240,48 +240,51 @@ async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], sessio
     """
     
     for cluster_id, nodes_data in clusters.items():
+        # 0. Pre-generate IDs for children to link and store in parent metadata
+        child_ids = [uuid.uuid4() for _ in nodes_data]
+        
         # 1. Summarize Cluster to get Topic Node info
-        # Check metadata from first node for fiscal context logic if strictly needed, 
-        # or pass it in. For now, generic.
         fiscal_meta = f"{nodes_data[0].get('company_ticker', '')} {nodes_data[0].get('fiscal_year', '')}"
         topic, summary = await summarize_cluster(nodes_data, fiscal_meta=fiscal_meta)
         
-        # 2. Create Topic Node (Level 1)
+        # 2. Key Step: Generate Embedding for the Summary (Level 1)
+        # We reuse the existing generate_embeddings function but need validation as it expects a list of dicts
+        # and modifies them in place.
+        summary_node_data = [{"text_content": summary}]
+        await generate_embeddings(summary_node_data)
+        summary_embedding = summary_node_data[0].get("embedding")
+
+        # 3. Create Topic Node (Level 1)
         topic_node = Node(
-            node_id=uuid.uuid4(), # Explicitly generate to link children
-            text_content=f"{topic}\n\n{summary}", # Or just summary? User said topic node.
-            # We should probably embed the summary too for searchability of topics!
-            embedding=None, # To be generated if desired, or skip for now
+            node_id=uuid.uuid4(),
+            text_content=summary, # Level 1 content is the Summary
+            topic=topic,          # New Column
+            embedding=summary_embedding, # Embed the summary for semantic search
             company_ticker=nodes_data[0].get("company_ticker", "UNKNOWN"),
             fiscal_year=nodes_data[0].get("fiscal_year", "UNKNOWN"),
             fiscal_quarter=nodes_data[0].get("fiscal_quarter"),
             level_depth=1, # TOPIC LEVEL
             node_metadata={
                 "cluster_id": int(cluster_id),
-                "topic_title": topic,
-                "summary": summary,
+                "child_node_ids": [str(uid) for uid in child_ids], # Metadata requirement
                 "child_count": len(nodes_data)
             }
         )
         
-        # OPTIONAL: Generate embedding for the topic node itself so we can search topics
-        # await generate_embeddings([{"text_content": topic_node.text_content}]) 
-        # But our function expects dicts. Let's do it manually if needed or skip.
-        # For graph traversal, we might not need vector search on topics immediately.
-        
         session.add(topic_node)
-        await session.flush() # Ensure topic_node is tracked but not committed yet if we want transactional integrity
+        await session.flush()
         
-        # 3. Create Chunk Nodes (Level 0) linked to Topic
-        for data in nodes_data:
+        # 4. Create Chunk Nodes (Level 0) linked to Topic
+        for i, data in enumerate(nodes_data):
             chunk_node = Node(
+                node_id=child_ids[i], # Use pre-generated ID
                 parent_node_id=topic_node.node_id,
                 text_content=data["text_content"],
                 embedding=data["embedding"],
                 company_ticker=data.get("company_ticker", "UNKNOWN"),
                 fiscal_year=data.get("fiscal_year", "UNKNOWN"),
                 fiscal_quarter=data.get("fiscal_quarter"),
-                level_depth=0, # CHUNK LEVEL (User correction: Level 1 -> Level 0)
+                level_depth=0, # CHUNK LEVEL
                 node_metadata={"provenance": data["provenance"]}
             )
             session.add(chunk_node)

@@ -9,9 +9,10 @@ from document_processor import process_document
 
 async def create_tables():
     async with engine.begin() as conn:
+        await conn.execute(sqlalchemy.text("DROP TABLE IF EXISTS nodes CASCADE"))
         await conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
-    print("Tables created.")
+    print("Tables created (clean slate).")
 
 async def main():
     await create_tables()
@@ -32,10 +33,14 @@ async def main():
             print(f"Nodes with parents: {result.scalar()}")
             
             # Show a sample topic
-            result = await conn.execute(sqlalchemy.text("SELECT text_content FROM nodes WHERE level_depth = 1 LIMIT 1"))
+            result = await conn.execute(sqlalchemy.text("SELECT text_content, topic, node_metadata, embedding FROM nodes WHERE level_depth = 1 LIMIT 1"))
             row = result.fetchone()
             if row:
-                print(f"\nSample Topic Node Content:\n{row[0]}")
+                print(f"\nSample Topic Node:")
+                print(f"Content (Summary): {row[0]}")
+                print(f"Topic: {row[1]}")
+                print(f"Metadata Keys: {list(row[2].keys())}")
+                print(f"Has Embedding: {row[3] is not None}")
 
     except Exception as e:
         print(f"Processing failed: {e}")
