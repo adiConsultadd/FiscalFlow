@@ -276,29 +276,30 @@ async def get_children_nodes(parent_node_ids: List[str]) -> List[Dict[str, Any]]
 async def vector_search_in_scope(
     query: str,
     parent_topic_ids: List[str],
-    top_k: int = 10
+    chunks_per_topic: int = 5,
+    final_top_k: int = 15
 ) -> List[ChunkWithMetadata]:
     """
-    Performs semantic vector search scoped to children of specific topic nodes.
-    Uses pgvector's cosine distance operator for similarity ranking.
-    Returns chunks WITH metadata for provenance tracking on the frontend.
+    Performs semantic vector search with BALANCED TOPIC COVERAGE.
     
-    Executes SQL Query (using pgvector):
-    ```sql
-    SELECT node_id, text_content, fiscal_year, fiscal_quarter, 
-           company_ticker, node_metadata,
-           1 - (embedding <=> :query_embedding) as similarity
-    FROM nodes
-    WHERE parent_node_id IN (:parent_topic_ids)
-      AND level_depth = 0
-    ORDER BY embedding <=> :query_embedding
-    LIMIT :top_k;
-    ```
+    NEW APPROACH (Per-Topic + Re-rank):
+    1. For EACH topic, retrieve top `chunks_per_topic` most similar chunks
+    2. Combine all candidates into a single pool
+    3. Re-rank the combined pool by similarity score
+    4. Return the final `final_top_k` chunks
+    
+    This ensures no topic is completely excluded due to another topic's
+    chunks being more similar to the query.
+    
+    Example:
+        10 topics × 5 chunks/topic = 50 candidates
+        Re-rank → return top 15
     
     Args:
         query: The original user query for embedding
         parent_topic_ids: Topic node IDs to scope the search
-        top_k: Number of chunks to retrieve
+        chunks_per_topic: How many chunks to retrieve from each topic
+        final_top_k: Final number of chunks to return after re-ranking
         
     Returns:
         List of ChunkWithMetadata dicts containing text, similarity, and provenance
@@ -316,78 +317,81 @@ async def vector_search_in_scope(
         print("[WARNING] Failed to generate query embedding")
         return []
     
+    all_candidates = []
+    
     async with AsyncSessionLocal() as session:
         try:
-            # Build parameterized query for parent IDs
-            ids_placeholder = ', '.join([f":id_{i}" for i in range(len(parent_topic_ids))])
+            # Fetch chunks from EACH topic individually
+            for topic_id in parent_topic_ids:
+                query_sql = """
+                    SELECT node_id, text_content, fiscal_year, fiscal_quarter, 
+                           company_ticker, node_metadata,
+                           1 - (embedding <=> :query_embedding) as similarity
+                    FROM nodes
+                    WHERE parent_node_id = :topic_id
+                      AND level_depth = 0
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> :query_embedding
+                    LIMIT :chunks_per_topic
+                """
+                
+                params = {
+                    "query_embedding": str(query_embedding),
+                    "topic_id": topic_id,
+                    "chunks_per_topic": chunks_per_topic
+                }
+                
+                result = await session.execute(text(query_sql), params)
+                rows = result.fetchall()
+                
+                # Add chunks from this topic to the candidate pool
+                for row in rows:
+                    metadata = row[5] or {}
+                    all_candidates.append({
+                        "node_id": str(row[0]),
+                        "text_content": row[1],
+                        "fiscal_year": row[2],
+                        "fiscal_quarter": row[3],
+                        "company_ticker": row[4],
+                        "provenance": metadata.get("provenance", {}),
+                        "similarity": float(row[6]) if row[6] else 0.0,
+                        "_topic_id": topic_id  # Track source topic for debugging
+                    })
             
-            # pgvector uses <=> for cosine distance (lower is more similar)
-            # Include node_metadata for provenance (page refs, file name, bbox)
-            query_sql = f"""
-                SELECT node_id, text_content, fiscal_year, fiscal_quarter, 
-                       company_ticker, node_metadata,
-                       1 - (embedding <=> :query_embedding) as similarity
-                FROM nodes
-                WHERE parent_node_id IN ({ids_placeholder})
-                  AND level_depth = 0
-                  AND embedding IS NOT NULL
-                ORDER BY embedding <=> :query_embedding
-                LIMIT :top_k
-            """
+            # Re-rank all candidates by similarity and take top final_top_k
+            all_candidates.sort(key=lambda x: x["similarity"], reverse=True)
+            final_chunks = all_candidates[:final_top_k]
             
-            # Build parameters
-            params = {
-                "query_embedding": str(query_embedding),
-                "top_k": top_k
-            }
-            for i, pid in enumerate(parent_topic_ids):
-                params[f"id_{i}"] = pid
+            # Remove internal tracking field before returning
+            for chunk in final_chunks:
+                chunk.pop("_topic_id", None)
             
-            result = await session.execute(text(query_sql), params)
-            rows = result.fetchall()
+            print(f"[VECTOR_SEARCH] Retrieved {len(all_candidates)} candidates from {len(parent_topic_ids)} topics, returning top {len(final_chunks)}")
             
-            # Build ChunkWithMetadata for each result
-            chunks = []
-            for row in rows:
-                metadata = row[5] or {}
-                chunks.append({
-                    "node_id": str(row[0]),
-                    "text_content": row[1],
-                    "fiscal_year": row[2],
-                    "fiscal_quarter": row[3],
-                    "company_ticker": row[4],
-                    "provenance": metadata.get("provenance", {}),
-                    "similarity": float(row[6]) if row[6] else 0.0
-                })
-            
-            return chunks
+            return final_chunks
             
         except Exception as e:
             print(f"Error in scoped vector search: {e}")
             return []
 
 
-async def global_vector_search(query: str, top_k: int = 10) -> List[ChunkWithMetadata]:
+
+async def global_vector_search(
+    query: str, 
+    top_k: int = 10,
+    fiscal_years: Optional[List[str]] = None
+) -> List[ChunkWithMetadata]:
     """
     Performs a global semantic search across all chunk nodes (level_depth = 0).
     Used as fallback for direct/simple queries when tree traversal is not needed.
     Returns chunks WITH metadata for provenance tracking.
     
-    Executes SQL Query:
-    ```sql
-    SELECT node_id, text_content, fiscal_year, fiscal_quarter,
-           company_ticker, node_metadata,
-           1 - (embedding <=> :query_embedding) as similarity
-    FROM nodes
-    WHERE level_depth = 0
-      AND embedding IS NOT NULL
-    ORDER BY embedding <=> :query_embedding
-    LIMIT :top_k;
-    ```
+    Now supports OPTIONAL fiscal_years filter to scope results to specific years.
     
     Args:
         query: User query for embedding
         top_k: Number of results
+        fiscal_years: Optional list of fiscal years to filter by (e.g., ['FY25'])
         
     Returns:
         List of ChunkWithMetadata dicts with provenance info
@@ -404,21 +408,43 @@ async def global_vector_search(query: str, top_k: int = 10) -> List[ChunkWithMet
     
     async with AsyncSessionLocal() as session:
         try:
-            query_sql = """
-                SELECT node_id, text_content, fiscal_year, fiscal_quarter,
-                       company_ticker, node_metadata,
-                       1 - (embedding <=> :query_embedding) as similarity
-                FROM nodes
-                WHERE level_depth = 0
-                  AND embedding IS NOT NULL
-                ORDER BY embedding <=> :query_embedding
-                LIMIT :top_k
-            """
-            
-            params = {
-                "query_embedding": str(query_embedding),
-                "top_k": top_k
-            }
+            # Build base query
+            if fiscal_years and len(fiscal_years) > 0:
+                # Add fiscal year filter
+                years_placeholder = ', '.join([f":year_{i}" for i in range(len(fiscal_years))])
+                query_sql = f"""
+                    SELECT node_id, text_content, fiscal_year, fiscal_quarter,
+                           company_ticker, node_metadata,
+                           1 - (embedding <=> :query_embedding) as similarity
+                    FROM nodes
+                    WHERE level_depth = 0
+                      AND embedding IS NOT NULL
+                      AND fiscal_year IN ({years_placeholder})
+                    ORDER BY embedding <=> :query_embedding
+                    LIMIT :top_k
+                """
+                params = {
+                    "query_embedding": str(query_embedding),
+                    "top_k": top_k
+                }
+                for i, year in enumerate(fiscal_years):
+                    params[f"year_{i}"] = year
+            else:
+                # No year filter - search all
+                query_sql = """
+                    SELECT node_id, text_content, fiscal_year, fiscal_quarter,
+                           company_ticker, node_metadata,
+                           1 - (embedding <=> :query_embedding) as similarity
+                    FROM nodes
+                    WHERE level_depth = 0
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> :query_embedding
+                    LIMIT :top_k
+                """
+                params = {
+                    "query_embedding": str(query_embedding),
+                    "top_k": top_k
+                }
             
             result = await session.execute(text(query_sql), params)
             rows = result.fetchall()
@@ -558,8 +584,8 @@ async def tree_traverser(state: AgentState) -> AgentState:
     # FALLBACK: Direct query bypass
     # -------------------------------------------------------------------------
     if state.get("is_direct_query", False):
-        state["traversal_log"].append("[TREE_TRAVERSER] Direct query detected, using global vector search")
-        chunks = await global_vector_search(query, top_k=10)
+        state["traversal_log"].append(f"[TREE_TRAVERSER] Direct query detected, using global vector search (filtered to {target_years})")
+        chunks = await global_vector_search(query, top_k=15, fiscal_years=target_years)
         state["retrieved_chunks"] = chunks
         return state
     
@@ -575,8 +601,8 @@ async def tree_traverser(state: AgentState) -> AgentState:
     )
     
     if not year_nodes:
-        state["traversal_log"].append("[TREE_TRAVERSER] No year nodes found, falling back to global search")
-        chunks = await global_vector_search(query, top_k=10)
+        state["traversal_log"].append(f"[TREE_TRAVERSER] No year nodes found, falling back to global search (filtered to {target_years})")
+        chunks = await global_vector_search(query, top_k=15, fiscal_years=target_years)
         state["retrieved_chunks"] = chunks
         return state
     
@@ -592,8 +618,8 @@ async def tree_traverser(state: AgentState) -> AgentState:
     # LEVEL 2: QUARTER PRUNING  
     # -------------------------------------------------------------------------
     if not surviving_year_ids:
-        state["traversal_log"].append("[TREE_TRAVERSER] All years pruned, using global search")
-        chunks = await global_vector_search(query, top_k=10)
+        state["traversal_log"].append(f"[TREE_TRAVERSER] All years pruned, using global search (filtered to {target_years})")
+        chunks = await global_vector_search(query, top_k=15, fiscal_years=target_years)
         state["retrieved_chunks"] = chunks
         return state
     
@@ -610,8 +636,8 @@ async def tree_traverser(state: AgentState) -> AgentState:
     # LEVEL 1: TOPIC PRUNING
     # -------------------------------------------------------------------------
     if not surviving_quarter_ids:
-        state["traversal_log"].append("[TREE_TRAVERSER] All quarters pruned, using global search")
-        chunks = await global_vector_search(query, top_k=10)
+        state["traversal_log"].append(f"[TREE_TRAVERSER] All quarters pruned, using global search (filtered to {target_years})")
+        chunks = await global_vector_search(query, top_k=15, fiscal_years=target_years)
         state["retrieved_chunks"] = chunks
         return state
     
@@ -630,11 +656,12 @@ async def tree_traverser(state: AgentState) -> AgentState:
     # LEVEL 0: VECTOR SEARCH (Scoped to surviving topics)
     # -------------------------------------------------------------------------
     if not surviving_topic_ids:
-        state["traversal_log"].append("[TREE_TRAVERSER] All topics pruned, using global search")
-        chunks = await global_vector_search(query, top_k=10)
+        state["traversal_log"].append(f"[TREE_TRAVERSER] All topics pruned, using global search (filtered to {target_years})")
+        chunks = await global_vector_search(query, top_k=15, fiscal_years=target_years)
     else:
         state["traversal_log"].append(f"[TREE_TRAVERSER] Vector search scoped to {len(surviving_topic_ids)} topic(s)")
-        chunks = await vector_search_in_scope(query, surviving_topic_ids, top_k=10)
+        # Fetch 5 chunks per topic, then re-rank and return top 15
+        chunks = await vector_search_in_scope(query, surviving_topic_ids, chunks_per_topic=5, final_top_k=15)
     
     state["retrieved_chunks"] = chunks
     return state
