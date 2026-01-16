@@ -37,6 +37,19 @@ load_dotenv()
 # AGENT STATE DEFINITION
 # =============================================================================
 
+class ChunkWithMetadata(TypedDict):
+    """
+    A retrieved chunk with its metadata for provenance tracking.
+    """
+    text_content: str
+    similarity: float
+    node_id: str
+    fiscal_year: str
+    fiscal_quarter: Optional[str]
+    company_ticker: str
+    provenance: Dict[str, Any]  # Contains page_index, page_label, file_name, bbox, etc.
+
+
 class AgentState(TypedDict):
     """
     Shared state passed between all nodes in the LangGraph.
@@ -46,7 +59,7 @@ class AgentState(TypedDict):
         target_years: List of fiscal years to scope (e.g., ['FY2021', 'FY2022'])
         target_quarters: List of quarters after pruning (e.g., ['Q1', 'Q2'])
         target_topics: List of topic node IDs after pruning
-        retrieved_chunks: List of text evidence from vector search
+        retrieved_chunks: List of chunk dicts with text and metadata for provenance
         final_answer: The synthesized forensic answer
         traversal_log: Debug info tracking pruning decisions at each level
         is_direct_query: Flag for simple fact lookups (bypass tree walk)
@@ -56,7 +69,7 @@ class AgentState(TypedDict):
     target_years: List[str]
     target_quarters: List[str]
     target_topics: List[Dict[str, Any]]
-    retrieved_chunks: List[str]
+    retrieved_chunks: List[ChunkWithMetadata]  # Now includes metadata!
     final_answer: str
     traversal_log: List[str]
     is_direct_query: bool
@@ -264,14 +277,16 @@ async def vector_search_in_scope(
     query: str,
     parent_topic_ids: List[str],
     top_k: int = 10
-) -> List[str]:
+) -> List[ChunkWithMetadata]:
     """
     Performs semantic vector search scoped to children of specific topic nodes.
     Uses pgvector's cosine distance operator for similarity ranking.
+    Returns chunks WITH metadata for provenance tracking on the frontend.
     
     Executes SQL Query (using pgvector):
     ```sql
-    SELECT text_content, 
+    SELECT node_id, text_content, fiscal_year, fiscal_quarter, 
+           company_ticker, node_metadata,
            1 - (embedding <=> :query_embedding) as similarity
     FROM nodes
     WHERE parent_node_id IN (:parent_topic_ids)
@@ -280,16 +295,13 @@ async def vector_search_in_scope(
     LIMIT :top_k;
     ```
     
-    This is the FINAL step where we retrieve actual evidence chunks.
-    We only search within the pruned scope (children of relevant topics).
-    
     Args:
         query: The original user query for embedding
         parent_topic_ids: Topic node IDs to scope the search
         top_k: Number of chunks to retrieve
         
     Returns:
-        List of text content from the most relevant chunks
+        List of ChunkWithMetadata dicts containing text, similarity, and provenance
     """
     if not DB_AVAILABLE:
         print("[WARNING] Database not available, returning empty list")
@@ -310,9 +322,10 @@ async def vector_search_in_scope(
             ids_placeholder = ', '.join([f":id_{i}" for i in range(len(parent_topic_ids))])
             
             # pgvector uses <=> for cosine distance (lower is more similar)
-            # We order by distance ascending to get most similar first
+            # Include node_metadata for provenance (page refs, file name, bbox)
             query_sql = f"""
-                SELECT text_content,
+                SELECT node_id, text_content, fiscal_year, fiscal_quarter, 
+                       company_ticker, node_metadata,
                        1 - (embedding <=> :query_embedding) as similarity
                 FROM nodes
                 WHERE parent_node_id IN ({ids_placeholder})
@@ -324,7 +337,7 @@ async def vector_search_in_scope(
             
             # Build parameters
             params = {
-                "query_embedding": str(query_embedding),  # pgvector expects string format
+                "query_embedding": str(query_embedding),
                 "top_k": top_k
             }
             for i, pid in enumerate(parent_topic_ids):
@@ -333,22 +346,38 @@ async def vector_search_in_scope(
             result = await session.execute(text(query_sql), params)
             rows = result.fetchall()
             
-            # Return just the text content
-            return [row[0] for row in rows]
+            # Build ChunkWithMetadata for each result
+            chunks = []
+            for row in rows:
+                metadata = row[5] or {}
+                chunks.append({
+                    "node_id": str(row[0]),
+                    "text_content": row[1],
+                    "fiscal_year": row[2],
+                    "fiscal_quarter": row[3],
+                    "company_ticker": row[4],
+                    "provenance": metadata.get("provenance", {}),
+                    "similarity": float(row[6]) if row[6] else 0.0
+                })
+            
+            return chunks
             
         except Exception as e:
             print(f"Error in scoped vector search: {e}")
             return []
 
 
-async def global_vector_search(query: str, top_k: int = 10) -> List[str]:
+async def global_vector_search(query: str, top_k: int = 10) -> List[ChunkWithMetadata]:
     """
     Performs a global semantic search across all chunk nodes (level_depth = 0).
     Used as fallback for direct/simple queries when tree traversal is not needed.
+    Returns chunks WITH metadata for provenance tracking.
     
     Executes SQL Query:
     ```sql
-    SELECT text_content
+    SELECT node_id, text_content, fiscal_year, fiscal_quarter,
+           company_ticker, node_metadata,
+           1 - (embedding <=> :query_embedding) as similarity
     FROM nodes
     WHERE level_depth = 0
       AND embedding IS NOT NULL
@@ -361,7 +390,7 @@ async def global_vector_search(query: str, top_k: int = 10) -> List[str]:
         top_k: Number of results
         
     Returns:
-        List of relevant text chunks
+        List of ChunkWithMetadata dicts with provenance info
     """
     if not DB_AVAILABLE:
         print("[WARNING] Database not available, returning empty list")
@@ -376,7 +405,9 @@ async def global_vector_search(query: str, top_k: int = 10) -> List[str]:
     async with AsyncSessionLocal() as session:
         try:
             query_sql = """
-                SELECT text_content
+                SELECT node_id, text_content, fiscal_year, fiscal_quarter,
+                       company_ticker, node_metadata,
+                       1 - (embedding <=> :query_embedding) as similarity
                 FROM nodes
                 WHERE level_depth = 0
                   AND embedding IS NOT NULL
@@ -392,7 +423,21 @@ async def global_vector_search(query: str, top_k: int = 10) -> List[str]:
             result = await session.execute(text(query_sql), params)
             rows = result.fetchall()
             
-            return [row[0] for row in rows]
+            # Build ChunkWithMetadata for each result
+            chunks = []
+            for row in rows:
+                metadata = row[5] or {}
+                chunks.append({
+                    "node_id": str(row[0]),
+                    "text_content": row[1],
+                    "fiscal_year": row[2],
+                    "fiscal_quarter": row[3],
+                    "company_ticker": row[4],
+                    "provenance": metadata.get("provenance", {}),
+                    "similarity": float(row[6]) if row[6] else 0.0
+                })
+            
+            return chunks
             
         except Exception as e:
             print(f"Error in global vector search: {e}")
@@ -690,9 +735,9 @@ async def synthesizer(state: AgentState) -> AgentState:
         state["final_answer"] = "I could not find relevant information to answer your query. Please try rephrasing or providing more specific time periods."
         return state
     
-    # Format evidence with citations
+    # Format evidence with citations - now chunks are dicts with metadata
     evidence_text = "\n\n".join([
-        f"[Evidence {i+1}]: {chunk}"
+        f"[Evidence {i+1}] ({chunk.get('fiscal_year', 'N/A')} {chunk.get('fiscal_quarter', '') or ''}, Page {chunk.get('provenance', {}).get('page_label', 'N/A')}): {chunk['text_content']}"
         for i, chunk in enumerate(chunks)
     ])
     
@@ -796,11 +841,25 @@ async def run_query(
     # Run the graph
     final_state = await app.ainvoke(initial_state)
     
+    # Build sources list with provenance for frontend
+    sources = []
+    for i, chunk in enumerate(final_state["retrieved_chunks"]):
+        sources.append({
+            "evidence_id": i + 1,
+            "text_content": chunk["text_content"],
+            "similarity": chunk.get("similarity", 0.0),
+            "fiscal_year": chunk.get("fiscal_year"),
+            "fiscal_quarter": chunk.get("fiscal_quarter"),
+            "company_ticker": chunk.get("company_ticker"),
+            "provenance": chunk.get("provenance", {})
+        })
+    
     return {
         "query": query,
         "answer": final_state["final_answer"],
         "target_years": final_state["target_years"],
         "chunks_retrieved": len(final_state["retrieved_chunks"]),
+        "sources": sources,  # Full provenance data for frontend!
         "traversal_log": final_state["traversal_log"]
     }
 
