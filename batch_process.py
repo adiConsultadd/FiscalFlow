@@ -2,20 +2,40 @@
 import os
 import asyncio
 from document_processor import process_document
+from excel_processor import process_excel_document
 
 DOCUMENTS_DIR = "documents"
 
 async def batch_process():
     for root, dirs, files in os.walk(DOCUMENTS_DIR):
         for file in files:
-            if file.lower().endswith(".pdf"):
-                file_path = os.path.join(root, file)
-                
-                # Extract metadata from path
-                # Expected format: documents/{company}/{year}/{quarter}/{file.pdf}
-                rel_path = os.path.relpath(file_path, DOCUMENTS_DIR)
-                parts = rel_path.split(os.sep)
-                
+            file_path = os.path.join(root, file)
+            
+            # Extract metadata from path
+            # Expected format: documents/{company}/{year}/{quarter}/{file.pdf}
+            # OR: documents/{company}/finance.xlsx
+            rel_path = os.path.relpath(file_path, DOCUMENTS_DIR)
+            parts = rel_path.split(os.sep)
+            
+            # Process Excel files
+            if file.lower().endswith(".xlsx"):
+                if len(parts) >= 2:  # documents/company/finance.xlsx
+                    company = parts[0]
+                    try:
+                        print(f"--> Found Excel: {file_path}, Company: {company}")
+                        await process_excel_document(
+                            file_path=file_path,
+                            company_ticker=company
+                        )
+                    except Exception as e:
+                        print(f"Failed to process Excel {file_path}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"Skipping Excel file outside expected structure: {rel_path}")
+            
+            # Process PDF files
+            elif file.lower().endswith(".pdf"):
                 if len(parts) >= 3:
                     company = parts[0]
                     year = parts[1]
