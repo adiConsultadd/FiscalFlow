@@ -468,20 +468,23 @@ async def time_scoper(state: AgentState) -> AgentState:
 Your task is to identify which fiscal years a query is asking about.
 
 Rules:
-1. If the query mentions specific years (FY2023, 2023, fiscal year 2023), return those exact years
+1. If the query mentions specific years (FY24, 2024, fiscal year 2024), return those exact years
 2. If the query says "recent", "latest", "current", return the last 2-3 fiscal years
 3. If the query says "historical", "over time", "evolution", return the last 4-5 fiscal years
 4. If the query is vague about time, default to the last 3 fiscal years
 5. Also determine if this is a "direct" simple fact query (single data point) or "complex" (requires analysis)
 
+IMPORTANT: Use TWO-DIGIT year format like FY24, FY25, FY26 (NOT FY2024, FY2025).
+
 Respond in this exact format:
-YEARS: FY2021, FY2022, FY2023
+YEARS: FY24, FY25, FY26
 QUERY_TYPE: DIRECT or COMPLEX"""
 
     user_prompt = f"""Query: "{query}"
 
 Current calendar year is {current_year}. 
-What fiscal years should we search, and is this a direct or complex query?"""
+What fiscal years should we search? Use FY24/FY25/FY26 format (two digits).
+Is this a direct or complex query?"""
 
     try:
         response = await pruning_llm.ainvoke([
@@ -499,21 +502,29 @@ What fiscal years should we search, and is this a direct or complex query?"""
             if line.startswith('YEARS:'):
                 years_str = line.replace('YEARS:', '').strip()
                 years = [y.strip() for y in years_str.split(',')]
+                # Normalize any 4-digit years to 2-digit format
+                normalized_years = []
+                for y in years:
+                    # Convert FY2024 -> FY24, FY2025 -> FY25, etc.
+                    if len(y) == 6 and y.startswith('FY20'):
+                        y = 'FY' + y[4:]  # FY2024 -> FY24
+                    normalized_years.append(y)
+                years = normalized_years
             elif line.startswith('QUERY_TYPE:'):
                 query_type = line.replace('QUERY_TYPE:', '').strip()
                 is_direct = query_type.upper() == 'DIRECT'
         
-        # Fallback if parsing fails
+        # Fallback if parsing fails - use two-digit format
         if not years:
-            years = [f"FY{current_year}", f"FY{current_year-1}", f"FY{current_year-2}"]
+            years = [f"FY{str(current_year)[2:]}", f"FY{str(current_year-1)[2:]}", f"FY{str(current_year-2)[2:]}"]
             
         state["target_years"] = years
         state["is_direct_query"] = is_direct
         state["traversal_log"].append(f"[TIME_SCOPER] Identified years: {years}, Direct query: {is_direct}")
         
     except Exception as e:
-        # Fallback to last 3 years
-        state["target_years"] = [f"FY{current_year}", f"FY{current_year-1}", f"FY{current_year-2}"]
+        # Fallback to last 3 years with two-digit format
+        state["target_years"] = [f"FY{str(current_year)[2:]}", f"FY{str(current_year-1)[2:]}", f"FY{str(current_year-2)[2:]}"]
         state["is_direct_query"] = False
         state["traversal_log"].append(f"[TIME_SCOPER] Error: {e}, using fallback years")
     
