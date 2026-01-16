@@ -31,26 +31,16 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
         with pdfplumber.open(file_path) as pdf:
             for i, page in enumerate(pdf.pages):
                 words = page.extract_words()
-                # We can group words or just take the full text and reconstruct mappings
-                # For semantic chunking, getting the full text with a simple map is often easiest.
-                # However, for detailed provenance, let's keep page-level context.
-                
                 text = page.extract_text()
                 if not text:
                     continue
-                
-                # To get character-level bounding boxes precisely is complex. 
-                # Simplification: We will store page-level provenance for the chunks for now,
-                # or we can try to map characters back. 
-                # Start index for this page in the hypothetical "full document string" 
-                # if we were concatenating, but we process page by page or globally.
                 
                 extracted_data.append({
                     "page_index": i,
                     "page_label": str(page.page_number),
                     "file_name": file_name,
                     "text": text,
-                    "words": words, # List of dicts: {'text': '...', 'x0': ..., 'top': ...}
+                    "words": words, 
                     "width": page.width,
                     "height": page.height
                 })
@@ -62,7 +52,12 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
 # -------------------------------------------------------------------------
 # 2. SEMANTIC CHUNKING
 # -------------------------------------------------------------------------
-def semantic_chunking(parsed_data: List[Dict[str, Any]], chunk_size: int = 500, overlap: int = 50) -> List[Dict[str, Any]]:
+def semantic_chunking(parsed_data: List[Dict[str, Any]], 
+                      chunk_size: int = 500, 
+                      overlap: int = 50,
+                      company_ticker: str = "UNKNOWN",
+                      fiscal_year: str = "UNKNOWN",
+                      fiscal_quarter: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Breaks parsed text into semantic chunks with metadata.
     """
@@ -77,33 +72,26 @@ def semantic_chunking(parsed_data: List[Dict[str, Any]], chunk_size: int = 500, 
         if not text:
             continue
             
-        # Naive sliding window chunking for demonstration
-        # A more advanced semantic chunker would strictly respect sentence boundaries
-        
         i = 0
         while i < len(text):
             end = min(i + chunk_size, len(text))
             chunk_text = text[i:end]
             
-            # Simple metadata - for bbox we would ideally look up the specific words in this range
-            # For this implementation, we will use the page bbox as a placeholder or 
-            # attempt to find the bounding box of the text if possible provided 'words' data.
-            # Calculating exact bbox for a substring is computationally intensive without character map.
-            
             provenance = {
                 "page_index": page_index,
                 "page_label": page_label,
                 "file_name": file_name,
-                "bbox": [0, 0, float(page_data["width"]), float(page_data["height"])], # Default to full page if exact not calc
-                "char_start": i, # Relative to page text start
+                "bbox": [0, 0, float(page_data["width"]), float(page_data["height"])], 
+                "char_start": i,
                 "char_end": end
             }
             
             chunks.append({
                 "text_content": chunk_text,
                 "provenance": provenance,
-                "company_ticker": "UNKNOWN", # Placeholder, logic to extract this needed
-                "fiscal_year": "FY24"        # Placeholder
+                "company_ticker": company_ticker,
+                "fiscal_year": fiscal_year,
+                "fiscal_quarter": fiscal_quarter
             })
             
             i += (chunk_size - overlap)
@@ -248,8 +236,6 @@ async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], sessio
         topic, summary = await summarize_cluster(nodes_data, fiscal_meta=fiscal_meta)
         
         # 2. Key Step: Generate Embedding for the Summary (Level 1)
-        # We reuse the existing generate_embeddings function but need validation as it expects a list of dicts
-        # and modifies them in place.
         summary_node_data = [{"text_content": summary}]
         await generate_embeddings(summary_node_data)
         summary_embedding = summary_node_data[0].get("embedding")
@@ -257,16 +243,16 @@ async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], sessio
         # 3. Create Topic Node (Level 1)
         topic_node = Node(
             node_id=uuid.uuid4(),
-            text_content=summary, # Level 1 content is the Summary
-            topic=topic,          # New Column
-            embedding=summary_embedding, # Embed the summary for semantic search
+            text_content=summary, 
+            topic=topic,          
+            embedding=summary_embedding, 
             company_ticker=nodes_data[0].get("company_ticker", "UNKNOWN"),
             fiscal_year=nodes_data[0].get("fiscal_year", "UNKNOWN"),
             fiscal_quarter=nodes_data[0].get("fiscal_quarter"),
-            level_depth=1, # TOPIC LEVEL
+            level_depth=1, 
             node_metadata={
                 "cluster_id": int(cluster_id),
-                "child_node_ids": [str(uid) for uid in child_ids], # Metadata requirement
+                "child_node_ids": [str(uid) for uid in child_ids], 
                 "child_count": len(nodes_data)
             }
         )
@@ -277,14 +263,14 @@ async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], sessio
         # 4. Create Chunk Nodes (Level 0) linked to Topic
         for i, data in enumerate(nodes_data):
             chunk_node = Node(
-                node_id=child_ids[i], # Use pre-generated ID
+                node_id=child_ids[i], 
                 parent_node_id=topic_node.node_id,
                 text_content=data["text_content"],
                 embedding=data["embedding"],
                 company_ticker=data.get("company_ticker", "UNKNOWN"),
                 fiscal_year=data.get("fiscal_year", "UNKNOWN"),
                 fiscal_quarter=data.get("fiscal_quarter"),
-                level_depth=0, # CHUNK LEVEL
+                level_depth=0, 
                 node_metadata={"provenance": data["provenance"]}
             )
             session.add(chunk_node)
@@ -295,15 +281,21 @@ async def save_hierarchy_to_db(clusters: Dict[int, List[Dict[str, Any]]], sessio
 # -------------------------------------------------------------------------
 # ORCHESTRATOR
 # -------------------------------------------------------------------------
-async def process_document(file_path: str):
-    print(f"Processing {file_path}...")
+async def process_document(file_path: str, 
+                           company_ticker: str = "UNKNOWN", 
+                           fiscal_year: str = "UNKNOWN", 
+                           fiscal_quarter: Optional[str] = None):
+    print(f"Processing {file_path} for {company_ticker} {fiscal_year} {fiscal_quarter}...")
     
     # 1. Parse
     parsed_data = parse_pdf(file_path)
     print(f"Parsed {len(parsed_data)} pages.")
     
     # 2. Chunk
-    chunks = semantic_chunking(parsed_data)
+    chunks = semantic_chunking(parsed_data, 
+                               company_ticker=company_ticker, 
+                               fiscal_year=fiscal_year, 
+                               fiscal_quarter=fiscal_quarter)
     print(f"Created {len(chunks)} chunks.")
     
     # 3. Embed
@@ -319,7 +311,6 @@ async def process_document(file_path: str):
         await save_hierarchy_to_db(clusters, session)
 
 if __name__ == "__main__":
-    # Test run
     import sys
     if len(sys.argv) > 1:
         file_path = sys.argv[1]
