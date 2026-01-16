@@ -12,6 +12,7 @@ from sqlalchemy import select, update, and_
 from openai import AsyncOpenAI
 from sklearn.cluster import KMeans
 from dotenv import load_dotenv
+import re
 
 from database import AsyncSessionLocal
 from models import Node
@@ -22,11 +23,12 @@ load_dotenv()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # -------------------------------------------------------------------------
-# 1. PARSER FUNCTION (OCR with Marker)
+# IMPROVED MARKER PARSER WITH BETTER PAGE TRACKING
 # -------------------------------------------------------------------------
 def parse_pdf_with_marker(file_path: str) -> List[Dict[str, Any]]:
     """
     Parses a PDF using Marker (OCR) and extracts text blocks with BBox metadata.
+    Enhanced to maintain page-level information even in fallback scenarios.
     """
     print(f"Parsing {file_path} with Marker (OCR)...")
     extracted_data = []
@@ -40,88 +42,187 @@ def parse_pdf_with_marker(file_path: str) -> List[Dict[str, Any]]:
         rendered = converter(file_path)
         
         # Traverse the Rendered object
-        # Structure: Rendered -> children (Pages) -> children (Blocks/Lines)
-        
         if hasattr(rendered, 'children'):
             for i, page in enumerate(rendered.children):
                 page_width = 0
                 page_height = 0
                 
-                # Try to find page dimensions if available
-                if hasattr(page, 'polygon'):
-                     # Polygon is usually [x, y, x, y...]. BBox is cleaner if present.
-                     pass
+                # Try to get page dimensions
+                if hasattr(page, 'bbox') and page.bbox:
+                    page_width = page.bbox[2] - page.bbox[0]
+                    page_height = page.bbox[3] - page.bbox[1]
                 
-                # Check blocks
+                # Collect all text from this page
+                page_blocks = []
+                
                 if hasattr(page, 'children'):
                     for block in page.children:
                         # Extract text
-                        # block might be a TextBlock, Image, etc.
-                        # We use simple string representation or check content
-                        # Marker blocks usually have a 'html' or 'text' property or __str__
-                        
-                        # Fallback for text extraction from block
                         text = ""
                         if hasattr(block, 'html'):
                             text = block.html
+                        elif hasattr(block, 'text'):
+                            text = block.text
                         elif hasattr(block, 'lines'):
-                             # Some versions use lines
-                             text = "\n".join([l.html for l in block.lines])
+                            text = "\n".join([getattr(l, 'html', str(l)) for l in block.lines])
                         else:
-                             # Convert to string and strip tags if needed, or simplistic approach
-                             # Let's trust marker's block to string
-                             text = str(block)
+                            text = str(block)
 
                         # BBox
-                        bbox = [0, 0, 0, 0] # Default
-                        if hasattr(block, 'bbox'):
-                            bbox = block.bbox
-                        elif hasattr(block, 'polygon'):
-                            # Approximate bbox from polygon
+                        bbox = [0, 0, 0, 0]
+                        if hasattr(block, 'bbox') and block.bbox:
+                            bbox = list(block.bbox)
+                        elif hasattr(block, 'polygon') and block.polygon:
                             xs = [p[0] for p in block.polygon]
                             ys = [p[1] for p in block.polygon]
                             if xs and ys:
                                 bbox = [min(xs), min(ys), max(xs), max(ys)]
                         
                         if text.strip():
-                            extracted_data.append({
-                                "page_index": i,
-                                "page_label": str(i+1),
-                                "file_name": file_name,
-                                "text": text, # This might be markdown/html
-                                "width": page_width, # Marker might not expose this easily per page object
-                                "height": page_height,
-                                "bbox": bbox,
-                                "is_markdown": True
+                            page_blocks.append({
+                                "text": text,
+                                "bbox": bbox
                             })
+                
+                # If we got blocks for this page, add them
+                if page_blocks:
+                    for block_data in page_blocks:
+                        extracted_data.append({
+                            "page_index": i,
+                            "page_label": str(i + 1),
+                            "file_name": file_name,
+                            "text": block_data["text"],
+                            "width": page_width,
+                            "height": page_height,
+                            "bbox": block_data["bbox"],
+                            "is_markdown": True
+                        })
                             
-        # Fallback if traversal failed or returned nothing
+        # IMPROVED FALLBACK: Split by page markers if traversal failed
         if not extracted_data:
-             print("Marker traversal yielded no blocks, using full text fallback.")
-             full_text, _, _ = text_from_rendered(rendered)
-             extracted_data.append({
-                 "page_index": 0,
-                 "page_label": "1-N",
-                 "file_name": file_name,
-                 "text": full_text,
-                 "width": 0,
-                 "height": 0,
-                 "bbox": [0,0,0,0],
-                 "is_markdown": True
-             })
+            print("Marker traversal yielded no blocks, attempting smart fallback...")
+            full_text, _, _ = text_from_rendered(rendered)
+            
+            # Try to split by page markers in the markdown
+            # Marker often includes page breaks or we can split by form feeds
+            page_splits = split_text_into_pages(full_text)
+            
+            if len(page_splits) > 1:
+                # We successfully split into pages
+                for idx, page_text in enumerate(page_splits):
+                    if page_text.strip():
+                        extracted_data.append({
+                            "page_index": idx,
+                            "page_label": str(idx + 1),
+                            "file_name": file_name,
+                            "text": page_text,
+                            "width": 0,
+                            "height": 0,
+                            "bbox": [0, 0, 0, 0],
+                            "is_markdown": True
+                        })
+            else:
+                # Last resort: use PDFPlumber for page info, Marker text for content
+                print("Using hybrid approach: PDFPlumber pages + Marker text...")
+                extracted_data = hybrid_parse(file_path, full_text)
 
     except Exception as e:
         print(f"Error parsing PDF with Marker {file_path}: {e}")
-        # Fallback to PDFPlumber? 
         print("Falling back to PDFPlumber...")
         return parse_pdf(file_path)
     
     return extracted_data
 
-# Keep original as fallback
+
+def split_text_into_pages(text: str) -> List[str]:
+    """
+    Attempts to split Marker output into pages using common delimiters.
+    """
+    # Try different page break patterns
+    patterns = [
+        r'\n---\n',  # Horizontal rule (common in Marker output)
+        r'\f',        # Form feed character
+        r'\n##\s*Page\s*\d+',  # Page headers
+        r'\n#{1,2}\s*\d+\s*\n',  # Numbered headers
+    ]
+    
+    for pattern in patterns:
+        pages = re.split(pattern, text)
+        if len(pages) > 1:
+            return pages
+    
+    # No clear delimiter found
+    return [text]
+
+
+def hybrid_parse(file_path: str, marker_text: str) -> List[Dict[str, Any]]:
+    """
+    Uses PDFPlumber to get page boundaries, but uses Marker's OCR text.
+    This maintains page-level accuracy even when Marker's structure is unclear.
+    """
+    extracted_data = []
+    file_name = os.path.basename(file_path)
+    
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            # Get total character count to estimate page breaks
+            total_chars = len(marker_text)
+            chars_per_page = total_chars // len(pdf.pages) if len(pdf.pages) > 0 else total_chars
+            
+            for i, page in enumerate(pdf.pages):
+                # Estimate text for this page
+                start_char = i * chars_per_page
+                end_char = min((i + 1) * chars_per_page, total_chars)
+                
+                # Add some overlap to avoid cutting mid-sentence
+                if i < len(pdf.pages) - 1:
+                    end_char += 100  # Look ahead 100 chars
+                    # Try to break at sentence end
+                    chunk = marker_text[start_char:end_char]
+                    last_period = chunk.rfind('.')
+                    if last_period > chars_per_page - 200:  # If period is reasonably close to target
+                        end_char = start_char + last_period + 1
+                
+                page_text = marker_text[start_char:end_char]
+                
+                if page_text.strip():
+                    extracted_data.append({
+                        "page_index": i,
+                        "page_label": str(page.page_number),
+                        "file_name": file_name,
+                        "text": page_text,
+                        "width": page.width,
+                        "height": page.height,
+                        "bbox": [0, 0, page.width, page.height],
+                        "is_markdown": True
+                    })
+                    
+    except Exception as e:
+        print(f"Error in hybrid parse: {e}")
+        # Ultimate fallback: just return the full text with estimated pages
+        estimated_pages = max(1, len(marker_text) // 3000)  # ~3000 chars per page
+        chars_per_page = len(marker_text) // estimated_pages
+        
+        for i in range(estimated_pages):
+            start = i * chars_per_page
+            end = min((i + 1) * chars_per_page, len(marker_text))
+            extracted_data.append({
+                "page_index": i,
+                "page_label": str(i + 1),
+                "file_name": file_name,
+                "text": marker_text[start:end],
+                "width": 612,  # Standard letter width in points
+                "height": 792,  # Standard letter height in points
+                "bbox": [0, 0, 612, 792],
+                "is_markdown": True
+            })
+    
+    return extracted_data
+
+
 def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
     """
-    Parses a PDF file and extracts text with metadata (page number, bbox, etc.)
+    Original PDFPlumber parser - kept as ultimate fallback.
     """
     extracted_data = []
     file_name = os.path.basename(file_path)
@@ -142,12 +243,13 @@ def parse_pdf(file_path: str) -> List[Dict[str, Any]]:
                     "words": words, 
                     "width": page.width,
                     "height": page.height,
-                    "bbox": [0, 0, page.width, page.height] # Page level
+                    "bbox": [0, 0, page.width, page.height]
                 })
     except Exception as e:
         print(f"Error parsing PDF {file_path}: {e}")
     
     return extracted_data
+
 
 # -------------------------------------------------------------------------
 # 2. SEMANTIC CHUNKING
